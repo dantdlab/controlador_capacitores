@@ -1,0 +1,23 @@
+@"
+# Entorno virtual
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Datos generados
+data/
+logs/
+*.csv
+
+# Archivos de VS Code / sistema
+.vscode/
+.DS_Store
+Thumbs.db
+"@ | Out-File -Encoding utf8 .gitignore
