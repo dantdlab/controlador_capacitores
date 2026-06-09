@@ -3,48 +3,29 @@
 """
 Lectura Modbus RTU RS485 para Circutor Computer SMART III / Smart Computer III.
 
-Estructura recomendada del proyecto:
-
-    MODBUS_PROJECT/
-    ├── .venv/
-    ├── config.ini
-    ├── read.py
-    ├── requirements.txt
-    └── data/
-        └── raw/
-
-Instalación inicial en Windows PowerShell, desde la carpeta MODBUS_PROJECT:
-
-    python -m venv .venv
-    .\.venv\Scripts\Activate.ps1
-    python -m pip install --upgrade pip
+Instalacion:
     pip install minimalmodbus pyserial
-    pip freeze > requirements.txt
 
-Ejecución normal:
-
+Ejemplos:
     python read.py
+    python read.py --port COM9 --interval 5
 
-El script lee por defecto el archivo:
-
-    config.ini
-
-Puedes sobrescribir valores del config.ini desde la terminal, por ejemplo:
-
-    python read.py --port COM5 --slave 1 --once
+Para activar el entorno virtual en PowerShell:
+    ./.venv/Scripts/Activate.ps1
 
 Notas importantes:
-- El mapa del manual usa direcciones HEXADECIMALES. Este script usa esas direcciones directamente.
-- Para variables de medida se usa función Modbus 04.
-- Por defecto, el equipo suele usar 19200 baudios, 8N1, slave/periférico 1.
-- El manual limita las tramas a 80 bytes; por seguridad aquí se leen registros de forma individual.
+- El mapa del manual usa direcciones hexadecimales. Este script usa esas direcciones directamente.
+- Para variables de medida se usa funcion Modbus 04.
+- Por defecto: 19200 baudios, 8N1, slave/periferico 1.
+- El manual limita las tramas a 80 bytes; por seguridad aqui se leen registros de forma individual.
 """
+
+from __future__ import annotations
 
 import argparse
 import configparser
 import csv
 import json
-import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -54,28 +35,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import minimalmodbus
 import serial
 
-now_utc = datetime.now(timezone.utc)
-now_local = now_utc.astimezone()
 
-# -----------------------------
-# Rutas base del proyecto
-# -----------------------------
-# Como tu estructura es:
-#   MODBUS_PROJECT/
-#   ├── config.ini
-#   └── read.py
-# PROJECT_ROOT será automáticamente la carpeta MODBUS_PROJECT.
-PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.ini"
-
-
-# -----------------------------
-# Ajustes de escalamiento
-# -----------------------------
-# En el manual aparece tensión como V/100 en la tabla, pero el ejemplo Modbus indica:
-# 0x0000084D = 2125 -> 212.5 V, por lo que el factor práctico es /10.
-# Si en campo observas 21.25 V o 2125 V, cambia --voltage-scale a 0.01 o 1.
 DEFAULT_VOLTAGE_SCALE = 0.1
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config.ini"
+DEFAULT_CSV_PATH = SCRIPT_DIR / "data" / "raw" / "smart_computer_iii_data.csv"
 
 
 class Reg:
@@ -87,7 +51,7 @@ class Reg:
         scale: float = 1.0,
         unit: str = "",
         description: str = "",
-    ):
+    ) -> None:
         self.name = name
         self.address = address
         self.kind = kind
@@ -96,174 +60,80 @@ class Reg:
         self.description = description
 
 
-# Variables principales de medida: función 04
-# Direcciones según mapa Modbus del Computer SMART III.
 MEASUREMENTS: List[Reg] = [
-    # Fase L1
-    Reg("voltage_L1_V", 0x0000, "u32", DEFAULT_VOLTAGE_SCALE, "V", "Tensión fase L1"),
-    Reg("current_L1_A", 0x0002, "u32", 0.001, "A", "Corriente L1"),
-    Reg("active_power_L1_kW", 0x0004, "u32", 0.001, "kW", "Potencia activa L1"),
-    Reg("reactive_inductive_L1_kvar", 0x0006, "u32", 0.001, "kvarL", "Potencia reactiva inductiva L1"),
-    Reg("reactive_capacitive_L1_kvar", 0x0008, "u32", 0.001, "kvarC", "Potencia reactiva capacitiva L1"),
-    Reg("reactive_power_L1_kvar", 0x000A, "u32", 0.001, "kvar", "Potencia reactiva L1"),
-    Reg("apparent_power_L1_kVA", 0x000C, "u32", 0.001, "kVA", "Potencia aparente L1"),
-    Reg("power_factor_L1", 0x0012, "u32", 0.01, "", "Factor de potencia L1"),
+    Reg("voltage_L1_V", 0x0000, "u32", DEFAULT_VOLTAGE_SCALE, "V", "Voltage L1"),
+    Reg("current_L1_A", 0x0002, "u32", 0.001, "A", "Current L1"),
+    Reg("active_power_L1_kW", 0x0004, "u32", 0.001, "kW", "Active power L1"),
+    Reg("reactive_inductive_L1_kvar", 0x0006, "u32", 0.001, "kvarL", "Inductive reactive power L1"),
+    Reg("reactive_capacitive_L1_kvar", 0x0008, "u32", 0.001, "kvarC", "Capacitive reactive power L1"),
+    Reg("reactive_power_L1_kvar", 0x000A, "u32", 0.001, "kvar", "Reactive power L1"),
+    Reg("apparent_power_L1_kVA", 0x000C, "u32", 0.001, "kVA", "Apparent power L1"),
+    Reg("power_factor_L1", 0x0012, "u32", 0.01, "", "Power factor L1"),
     Reg("cos_phi_L1", 0x0014, "u32", 0.01, "", "Cos phi L1"),
-    Reg("sign_kw_L1", 0x0016, "s32", 1.0, "", "Signo de kW L1"),
-    Reg("sign_kvar_L1", 0x0018, "s32", 1.0, "", "Signo de kvar L1"),
+    Reg("sign_kw_L1", 0x0016, "s32", 1.0, "", "Sign kW L1"),
+    Reg("sign_kvar_L1", 0x0018, "s32", 1.0, "", "Sign kvar L1"),
 
-    # Fase L2
-    Reg("voltage_L2_V", 0x001A, "u32", DEFAULT_VOLTAGE_SCALE, "V", "Tensión fase L2"),
-    Reg("current_L2_A", 0x001C, "u32", 0.001, "A", "Corriente L2"),
-    Reg("active_power_L2_kW", 0x001E, "u32", 0.001, "kW", "Potencia activa L2"),
-    Reg("reactive_inductive_L2_kvar", 0x0020, "u32", 0.001, "kvarL", "Potencia reactiva inductiva L2"),
-    Reg("reactive_capacitive_L2_kvar", 0x0022, "u32", 0.001, "kvarC", "Potencia reactiva capacitiva L2"),
-    Reg("reactive_power_L2_kvar", 0x0024, "u32", 0.001, "kvar", "Potencia reactiva L2"),
-    Reg("apparent_power_L2_kVA", 0x0026, "u32", 0.001, "kVA", "Potencia aparente L2"),
-    Reg("power_factor_L2", 0x002C, "u32", 0.01, "", "Factor de potencia L2"),
+    Reg("voltage_L2_V", 0x001A, "u32", DEFAULT_VOLTAGE_SCALE, "V", "Voltage L2"),
+    Reg("current_L2_A", 0x001C, "u32", 0.001, "A", "Current L2"),
+    Reg("active_power_L2_kW", 0x001E, "u32", 0.001, "kW", "Active power L2"),
+    Reg("reactive_inductive_L2_kvar", 0x0020, "u32", 0.001, "kvarL", "Inductive reactive power L2"),
+    Reg("reactive_capacitive_L2_kvar", 0x0022, "u32", 0.001, "kvarC", "Capacitive reactive power L2"),
+    Reg("reactive_power_L2_kvar", 0x0024, "u32", 0.001, "kvar", "Reactive power L2"),
+    Reg("apparent_power_L2_kVA", 0x0026, "u32", 0.001, "kVA", "Apparent power L2"),
+    Reg("power_factor_L2", 0x002C, "u32", 0.01, "", "Power factor L2"),
     Reg("cos_phi_L2", 0x002E, "u32", 0.01, "", "Cos phi L2"),
-    Reg("sign_kw_L2", 0x0030, "s32", 1.0, "", "Signo de kW L2"),
-    Reg("sign_kvar_L2", 0x0032, "s32", 1.0, "", "Signo de kvar L2"),
+    Reg("sign_kw_L2", 0x0030, "s32", 1.0, "", "Sign kW L2"),
+    Reg("sign_kvar_L2", 0x0032, "s32", 1.0, "", "Sign kvar L2"),
 
-    # Fase L3
-    Reg("voltage_L3_V", 0x0034, "u32", DEFAULT_VOLTAGE_SCALE, "V", "Tensión fase L3"),
-    Reg("current_L3_A", 0x0036, "u32", 0.001, "A", "Corriente L3"),
-    Reg("active_power_L3_kW", 0x0038, "u32", 0.001, "kW", "Potencia activa L3"),
-    Reg("reactive_inductive_L3_kvar", 0x003A, "u32", 0.001, "kvarL", "Potencia reactiva inductiva L3"),
-    Reg("reactive_capacitive_L3_kvar", 0x003C, "u32", 0.001, "kvarC", "Potencia reactiva capacitiva L3"),
-    Reg("reactive_power_L3_kvar", 0x003E, "u32", 0.001, "kvar", "Potencia reactiva L3"),
-    Reg("apparent_power_L3_kVA", 0x0040, "u32", 0.001, "kVA", "Potencia aparente L3"),
-    Reg("power_factor_L3", 0x0046, "u32", 0.01, "", "Factor de potencia L3"),
+    Reg("voltage_L3_V", 0x0034, "u32", DEFAULT_VOLTAGE_SCALE, "V", "Voltage L3"),
+    Reg("current_L3_A", 0x0036, "u32", 0.001, "A", "Current L3"),
+    Reg("active_power_L3_kW", 0x0038, "u32", 0.001, "kW", "Active power L3"),
+    Reg("reactive_inductive_L3_kvar", 0x003A, "u32", 0.001, "kvarL", "Inductive reactive power L3"),
+    Reg("reactive_capacitive_L3_kvar", 0x003C, "u32", 0.001, "kvarC", "Capacitive reactive power L3"),
+    Reg("reactive_power_L3_kvar", 0x003E, "u32", 0.001, "kvar", "Reactive power L3"),
+    Reg("apparent_power_L3_kVA", 0x0040, "u32", 0.001, "kVA", "Apparent power L3"),
+    Reg("power_factor_L3", 0x0046, "u32", 0.01, "", "Power factor L3"),
     Reg("cos_phi_L3", 0x0048, "u32", 0.01, "", "Cos phi L3"),
-    Reg("sign_kw_L3", 0x004A, "s32", 1.0, "", "Signo de kW L3"),
-    Reg("sign_kvar_L3", 0x004C, "s32", 1.0, "", "Signo de kvar L3"),
+    Reg("sign_kw_L3", 0x004A, "s32", 1.0, "", "Sign kW L3"),
+    Reg("sign_kvar_L3", 0x004C, "s32", 1.0, "", "Sign kvar L3"),
 
-    # Trifásico
-    Reg("voltage_3ph_V", 0x004E, "u32", DEFAULT_VOLTAGE_SCALE, "V", "Tensión fase trifásica"),
-    Reg("current_3ph_A", 0x0050, "u32", 0.001, "A", "Corriente trifásica"),
-    Reg("active_power_3ph_kW", 0x0052, "u32", 0.001, "kW", "Potencia activa trifásica"),
-    Reg("reactive_inductive_3ph_kvar", 0x0054, "u32", 0.001, "kvarL", "Potencia inductiva trifásica"),
-    Reg("reactive_capacitive_3ph_kvar", 0x0056, "u32", 0.001, "kvarC", "Potencia capacitiva trifásica"),
-    Reg("reactive_power_3ph_kvar", 0x0058, "u32", 0.001, "kvar", "Potencia reactiva trifásica"),
-    Reg("apparent_power_3ph_kVA", 0x005A, "u32", 0.001, "kVA", "Potencia aparente trifásica"),
-    Reg("power_factor_3ph", 0x0060, "u32", 0.01, "", "Factor de potencia trifásico"),
-    Reg("cos_phi_3ph", 0x0062, "u32", 0.01, "", "Cos phi trifásico"),
-    Reg("sign_kw_3ph", 0x0064, "s32", 1.0, "", "Signo de kW trifásico"),
-    Reg("sign_kvar_3ph", 0x0066, "s32", 1.0, "", "Signo de kvar trifásico"),
-    Reg("frequency_Hz", 0x0068, "u32", 0.1, "Hz", "Frecuencia"),
-    Reg("voltage_L1_L2_V", 0x006A, "u32", DEFAULT_VOLTAGE_SCALE, "V", "Tensión L1-L2"),
-    Reg("voltage_L2_L3_V", 0x006C, "u32", DEFAULT_VOLTAGE_SCALE, "V", "Tensión L2-L3"),
-    Reg("voltage_L3_L1_V", 0x006E, "u32", DEFAULT_VOLTAGE_SCALE, "V", "Tensión L3-L1"),
-    Reg("neutral_current_A", 0x0070, "u32", 0.001, "A", "Corriente de neutro"),
-    Reg("leakage_current_mA", 0x0072, "u32", 1.0, "mA", "Corriente de fugas"),
-    Reg("temperature_C", 0x0074, "u32", 0.1, "°C", "Temperatura"),
-
-    # THD. El manual muestra % para THD; si el valor aparece x10, cambia el scale a 0.1.
-    Reg("thd_voltage_L1_pct", 0x007C, "u32", 1.0, "%", "THD tensión L1"),
-    Reg("thd_voltage_L2_pct", 0x007E, "u32", 1.0, "%", "THD tensión L2"),
-    Reg("thd_voltage_L3_pct", 0x0080, "u32", 1.0, "%", "THD tensión L3"),
-    Reg("thd_current_L1_pct", 0x0082, "u32", 1.0, "%", "THD corriente L1"),
-    Reg("thd_current_L2_pct", 0x0084, "u32", 1.0, "%", "THD corriente L2"),
-    Reg("thd_current_L3_pct", 0x0086, "u32", 1.0, "%", "THD corriente L3"),
+    Reg("voltage_3ph_V", 0x004E, "u32", DEFAULT_VOLTAGE_SCALE, "V", "Three phase voltage"),
+    Reg("current_3ph_A", 0x0050, "u32", 0.001, "A", "Three phase current"),
+    Reg("active_power_3ph_kW", 0x0052, "u32", 0.001, "kW", "Three phase active power"),
+    Reg("reactive_inductive_3ph_kvar", 0x0054, "u32", 0.001, "kvarL", "Three phase inductive reactive power"),
+    Reg("reactive_capacitive_3ph_kvar", 0x0056, "u32", 0.001, "kvarC", "Three phase capacitive reactive power"),
+    Reg("reactive_power_3ph_kvar", 0x0058, "u32", 0.001, "kvar", "Three phase reactive power"),
+    Reg("apparent_power_3ph_kVA", 0x005A, "u32", 0.001, "kVA", "Three phase apparent power"),
+    Reg("power_factor_3ph", 0x0060, "u32", 0.01, "", "Three phase power factor"),
+    Reg("cos_phi_3ph", 0x0062, "u32", 0.01, "", "Three phase cos phi"),
+    Reg("sign_kw_3ph", 0x0064, "s32", 1.0, "", "Three phase sign kW"),
+    Reg("sign_kvar_3ph", 0x0066, "s32", 1.0, "", "Three phase sign kvar"),
+    Reg("frequency_Hz", 0x0068, "u32", 0.1, "Hz", "Frequency"),
+    Reg("voltage_L1_L2_V", 0x006A, "u32", DEFAULT_VOLTAGE_SCALE, "V", "L1-L2 voltage"),
+    Reg("voltage_L2_L3_V", 0x006C, "u32", DEFAULT_VOLTAGE_SCALE, "V", "L2-L3 voltage"),
+    Reg("voltage_L3_L1_V", 0x006E, "u32", DEFAULT_VOLTAGE_SCALE, "V", "L3-L1 voltage"),
+    Reg("neutral_current_A", 0x0070, "u32", 0.001, "A", "Neutral current"),
+    Reg("leakage_current_mA", 0x0072, "u32", 1.0, "mA", "Leakage current"),
+    Reg("temperature_C", 0x0074, "u32", 0.1, "C", "Temperature"),
+    Reg("thd_voltage_L1_pct", 0x007C, "u32", 1.0, "%", "Voltage THD L1"),
+    Reg("thd_voltage_L2_pct", 0x007E, "u32", 1.0, "%", "Voltage THD L2"),
+    Reg("thd_voltage_L3_pct", 0x0080, "u32", 1.0, "%", "Voltage THD L3"),
+    Reg("thd_current_L1_pct", 0x0082, "u32", 1.0, "%", "Current THD L1"),
+    Reg("thd_current_L2_pct", 0x0084, "u32", 1.0, "%", "Current THD L2"),
+    Reg("thd_current_L3_pct", 0x0086, "u32", 1.0, "%", "Current THD L3"),
 ]
 
 
-# Energías: el manual separa kWh y Wh; aquí se integran en kWh/kvarh/kVAh.
 ENERGY_PAIRS: List[Tuple[str, int, int, str]] = [
-    ("active_energy_import_kWh", 0x0088, 0x008A, "Energía activa consumida"),
-    ("reactive_inductive_import_kvarh", 0x008C, 0x008E, "Energía inductiva consumida"),
-    ("reactive_capacitive_import_kvarh", 0x0090, 0x0092, "Energía capacitiva consumida"),
-    ("apparent_energy_import_kVAh", 0x0094, 0x0096, "Energía aparente consumida"),
-    ("active_energy_export_kWh", 0x0098, 0x009A, "Energía activa generada"),
-    ("reactive_inductive_export_kvarh", 0x009C, 0x009E, "Energía inductiva generada"),
-    ("reactive_capacitive_export_kvarh", 0x00A0, 0x00A2, "Energía capacitiva generada"),
-    ("apparent_energy_export_kVAh", 0x00A4, 0x00A6, "Energía aparente generada"),
+    ("active_energy_import_kWh", 0x0088, 0x008A, "Imported active energy"),
+    ("reactive_inductive_import_kvarh", 0x008C, 0x008E, "Imported inductive reactive energy"),
+    ("reactive_capacitive_import_kvarh", 0x0090, 0x0092, "Imported capacitive reactive energy"),
+    ("apparent_energy_import_kVAh", 0x0094, 0x0096, "Imported apparent energy"),
+    ("active_energy_export_kWh", 0x0098, 0x009A, "Exported active energy"),
+    ("reactive_inductive_export_kvarh", 0x009C, 0x009E, "Exported inductive reactive energy"),
+    ("reactive_capacitive_export_kvarh", 0x00A0, 0x00A2, "Exported capacitive reactive energy"),
+    ("apparent_energy_export_kVAh", 0x00A4, 0x00A6, "Exported apparent energy"),
 ]
-
-
-
-def resolve_project_path(path_value: str) -> str:
-    """
-    Convierte rutas relativas del config.ini a rutas absolutas dentro del proyecto.
-
-    Ejemplo:
-        data/raw/smart_computer_iii_data.csv
-
-    se convierte en:
-        C:/.../MODBUS_PROJECT/data/raw/smart_computer_iii_data.csv
-    """
-    path = Path(path_value)
-    if path.is_absolute():
-        return str(path)
-    return str(PROJECT_ROOT / path)
-
-
-def load_runtime_args(cli_args: argparse.Namespace) -> argparse.Namespace:
-    """
-    Carga la configuración desde config.ini y permite sobrescribir algunos valores desde consola.
-
-    Prioridad:
-        1. Argumentos escritos en terminal, por ejemplo: --port COM5
-        2. Valores definidos en config.ini
-        3. Valores por defecto dentro del código
-    """
-    config_path = Path(cli_args.config)
-    if not config_path.is_absolute():
-        config_path = PROJECT_ROOT / config_path
-
-    if not config_path.exists():
-        raise FileNotFoundError(f"No encontré el archivo de configuración: {config_path}")
-
-    config = configparser.ConfigParser()
-    config.read(config_path, encoding="utf-8")
-
-    args = argparse.Namespace()
-
-    # Comunicación RS485 / Modbus RTU
-    args.port = cli_args.port or config.get("serial", "port", fallback="COM5")
-    args.baud = cli_args.baud if cli_args.baud is not None else config.getint("serial", "baudrate", fallback=19200)
-    args.parity = cli_args.parity or config.get("serial", "parity", fallback="none")
-    args.bytesize = cli_args.bytesize if cli_args.bytesize is not None else config.getint("serial", "bytesize", fallback=8)
-    args.stopbits = cli_args.stopbits if cli_args.stopbits is not None else config.getint("serial", "stopbits", fallback=1)
-    args.timeout = cli_args.timeout if cli_args.timeout is not None else config.getfloat("serial", "timeout", fallback=1.0)
-
-    # Equipo
-    args.slave = cli_args.slave if cli_args.slave is not None else config.getint("device", "slave_id", fallback=1)
-    args.max_relays = (
-        cli_args.max_relays
-        if cli_args.max_relays is not None
-        else config.getint("device", "max_relays", fallback=14)
-    )
-
-    # Lectura
-    config_once = config.getboolean("read", "once", fallback=True)
-    args.once = True if cli_args.once else config_once
-    args.interval = (
-        cli_args.interval
-        if cli_args.interval is not None
-        else config.getfloat("read", "interval_seconds", fallback=0)
-    )
-    args.retries = cli_args.retries if cli_args.retries is not None else config.getint("read", "retries", fallback=1)
-    args.status = True if cli_args.status else config.getboolean("read", "status", fallback=True)
-    args.config_read = (
-        True if cli_args.config_read else config.getboolean("read", "config_read", fallback=False)
-    )
-
-    # Salida / logging
-    csv_from_config = config.get("logging", "csv_path", fallback="data/raw/smart_computer_iii_data.csv")
-    args.csv = resolve_project_path(cli_args.csv or csv_from_config)
-    args.json = True if cli_args.json else config.getboolean("logging", "print_json", fallback=False)
-    args.debug = True if cli_args.debug else config.getboolean("logging", "debug", fallback=False)
-
-    # Escalamiento
-    args.voltage_scale = (
-        cli_args.voltage_scale
-        if cli_args.voltage_scale is not None
-        else config.getfloat("scaling", "voltage_scale", fallback=DEFAULT_VOLTAGE_SCALE)
-    )
-
-    args.config_path = str(config_path)
-    return args
 
 
 def parse_parity(value: str) -> str:
@@ -274,7 +144,141 @@ def parse_parity(value: str) -> str:
         return serial.PARITY_EVEN
     if value in ("o", "odd", "impar"):
         return serial.PARITY_ODD
-    raise ValueError("Paridad no válida. Usa: none, even u odd.")
+    raise ValueError("Paridad no valida. Usa: none, even u odd.")
+
+
+def parse_int(parser: configparser.ConfigParser, section: str, option: str, fallback: int) -> int:
+    try:
+        return parser.getint(section, option, fallback=fallback)
+    except (ValueError, TypeError):
+        return fallback
+
+
+def parse_float(parser: configparser.ConfigParser, section: str, option: str, fallback: float) -> float:
+    try:
+        return parser.getfloat(section, option, fallback=fallback)
+    except (ValueError, TypeError):
+        return fallback
+
+
+def parse_text(parser: configparser.ConfigParser, section: str, option: str, fallback: str) -> str:
+    try:
+        return parser.get(section, option, fallback=fallback).strip()
+    except (ValueError, TypeError, AttributeError):
+        return fallback
+
+
+def parse_flag(parser: configparser.ConfigParser, section: str, option: str, fallback: bool = False) -> bool:
+    raw = parse_text(parser, section, option, "1" if fallback else "0").lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def resolve_path(path_value: str, base_dir: Path) -> Path:
+    candidate = Path(path_value).expanduser()
+    if not candidate.is_absolute():
+        candidate = base_dir / candidate
+    return candidate.resolve()
+
+
+def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
+    if not config_path.exists():
+        raise FileNotFoundError(f"No se encontro config.ini en: {config_path}")
+
+    parser = configparser.ConfigParser()
+    parser.read(config_path, encoding="utf-8")
+
+    csv_value = parse_text(
+        parser,
+        "logging",
+        "csv_path",
+        str((SCRIPT_DIR / "data" / "raw" / "smart_computer_iii_data.csv").relative_to(SCRIPT_DIR)),
+    )
+
+    return {
+        "config_path": config_path,
+        "project_root": config_path.parent,
+        "port": parse_text(parser, "serial", "port", "COM8"),
+        "baud": parse_int(parser, "serial", "baudrate", 19200),
+        "parity": parse_text(parser, "serial", "parity", "none"),
+        "bytesize": parse_int(parser, "serial", "bytesize", 8),
+        "stopbits": parse_int(parser, "serial", "stopbits", 1),
+        "timeout": parse_float(parser, "serial", "timeout", 1.0),
+        "slave": parse_int(parser, "device", "slave_id", 1),
+        "max_relays": parse_int(parser, "device", "max_relays", 14),
+        "once": parse_flag(parser, "read", "once", False),
+        "interval_seconds": parse_float(parser, "read", "interval_seconds", 10.0),
+        "retries": parse_int(parser, "read", "retries", 1),
+        "status": parse_flag(parser, "read", "status", True),
+        "config_read": parse_flag(parser, "read", "config_read", False),
+        "csv_path": resolve_path(csv_value, config_path.parent),
+        "print_json": parse_flag(parser, "logging", "print_json", False),
+        "debug": parse_flag(parser, "logging", "debug", False),
+        "voltage_scale": parse_float(parser, "scaling", "voltage_scale", DEFAULT_VOLTAGE_SCALE),
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Lectura Modbus RTU RS485 para Circutor Computer SMART III / Smart Computer III."
+    )
+    parser.add_argument("--port", default=None, help="Puerto serial. Ej: COM5, /dev/ttyUSB0, /dev/serial/by-id/...")
+    parser.add_argument("--slave", type=int, default=None, help="ID Modbus / Num. periferico")
+    parser.add_argument("--baud", type=int, default=None, help="Baudios")
+    parser.add_argument("--parity", default=None, help="Paridad: none, even, odd")
+    parser.add_argument("--bytesize", type=int, default=None, help="Bits de datos")
+    parser.add_argument("--stopbits", type=int, default=None, help="Stop bits")
+    parser.add_argument("--timeout", type=float, default=None, help="Timeout serial en segundos")
+    parser.add_argument("--retries", type=int, default=None, help="Reintentos por registro")
+    parser.add_argument("--interval", type=float, default=None, help="Intervalo en segundos")
+    parser.add_argument("--once", action="store_true", default=None, help="Ejecuta una sola lectura")
+    parser.add_argument("--csv", default=None, help="Ruta de salida CSV")
+    parser.add_argument("--json", action="store_true", default=None, help="Imprime JSON completo")
+    parser.add_argument("--status", action="store_true", default=None, help="Incluye relays, alarmas, salidas e inputs")
+    parser.add_argument("--config-read", action="store_true", default=None, help="Lee configuracion basica")
+    parser.add_argument("--max-relays", type=int, default=None, choices=[6, 12, 14], help="Modelo por numero de relays")
+    parser.add_argument("--voltage-scale", type=float, default=None, help="Factor para tension")
+    parser.add_argument("--debug", action="store_true", default=None, help="Activa debug de minimalmodbus")
+    return parser
+
+
+def merge_settings(base: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
+    settings = dict(base)
+
+    arg_to_setting = {
+        "port": "port",
+        "slave": "slave",
+        "baud": "baud",
+        "parity": "parity",
+        "bytesize": "bytesize",
+        "stopbits": "stopbits",
+        "timeout": "timeout",
+        "retries": "retries",
+        "interval": "interval_seconds",
+        "max_relays": "max_relays",
+        "voltage_scale": "voltage_scale",
+    }
+
+    for arg_name, setting_name in arg_to_setting.items():
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            settings[setting_name] = value
+
+    csv_value = getattr(args, "csv", None)
+    if csv_value is not None:
+        settings["csv_path"] = resolve_path(str(csv_value), base["project_root"])
+
+    for flag_name, setting_name in (
+        ("once", "once"),
+        ("json", "print_json"),
+        ("status", "status"),
+        ("config-read", "config_read"),
+        ("debug", "debug"),
+    ):
+        value = getattr(args, flag_name.replace("-", "_"), None)
+        if value is not None:
+            settings[setting_name] = bool(value)
+
+    return settings
 
 
 def make_instrument(
@@ -337,11 +341,11 @@ def safe_read(
     retries: int = 1,
     retry_delay: float = 0.2,
 ) -> Optional[Any]:
-    last_error = None
+    last_error: Optional[Exception] = None
     for attempt in range(retries + 1):
         try:
             return read_func()
-        except Exception as exc:  # minimalmodbus/serial exceptions
+        except Exception as exc:
             last_error = exc
             if attempt < retries:
                 time.sleep(retry_delay)
@@ -368,8 +372,8 @@ def read_measurements(
 ) -> Tuple[Dict[str, Any], Dict[str, str]]:
     errors: Dict[str, str] = {}
     data: Dict[str, Any] = {
-    "timestamp_local": now_local.isoformat(timespec="seconds"),
-    "timestamp_utc": now_utc.isoformat(timespec="seconds"),
+        "timestamp_local": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
     apply_voltage_scale(MEASUREMENTS, voltage_scale)
@@ -388,7 +392,6 @@ def read_measurements(
         data[reg.name + "_raw"] = raw
         data[reg.name] = scaled(raw, reg.scale)
 
-    # Valores firmados calculados con los registros de signo del equipo
     for phase in ("L1", "L2", "L3", "3ph"):
         p = data.get(f"active_power_{phase}_kW")
         sign_kw = data.get(f"sign_kw_{phase}")
@@ -400,13 +403,11 @@ def read_measurements(
         if isinstance(q, (int, float)) and sign_kvar in (-1, 1):
             data[f"reactive_power_{phase}_kvar_signed"] = q * sign_kvar
 
-    # Energías integradas: valor_k + valor_unidad/1000
     for name, k_addr, unit_addr, _desc in ENERGY_PAIRS:
         k_val = safe_read(lambda a=k_addr: read_u32(inst, a, 4), name + "_k_raw", errors, retries=retries)
         unit_val = safe_read(lambda a=unit_addr: read_u32(inst, a, 4), name + "_unit_raw", errors, retries=retries)
         data[name + "_k_raw"] = k_val
         data[name + "_unit_raw"] = unit_val
-
         if k_val is not None and unit_val is not None:
             data[name] = k_val + (unit_val / 1000.0)
         else:
@@ -448,11 +449,6 @@ def decode_outputs(value: Optional[int]) -> Dict[str, Optional[bool]]:
             "digital_output_2_on": None,
         }
 
-    # Manual:
-    # Bit 0: relé ventilador -> 1 ON / 0 OFF
-    # Bit 1: relé alarma -> 1 ON / 0 OFF
-    # Bit 2: salida digital 1 -> 1 OFF / 0 ON
-    # Bit 3: salida digital 2 -> 1 OFF / 0 ON
     return {
         "fan_relay_on": bool(value & (1 << 0)),
         "alarm_relay_on": bool(value & (1 << 1)),
@@ -465,7 +461,6 @@ def decode_inputs(value: Optional[int]) -> Dict[str, Optional[bool]]:
     if value is None:
         return {"digital_input_1_on": None, "digital_input_2_on": None}
 
-    # Manual: bit 0 y bit 1 -> 1 ON / 0 OFF
     return {
         "digital_input_1_on": bool(value & (1 << 0)),
         "digital_input_2_on": bool(value & (1 << 1)),
@@ -502,16 +497,15 @@ def read_device_config_basic(
     inst: minimalmodbus.Instrument,
     retries: int = 1,
 ) -> Tuple[Dict[str, Any], Dict[str, str]]:
-    """Lectura básica de configuración de comunicaciones con función 04."""
     errors: Dict[str, str] = {}
     data: Dict[str, Any] = {}
 
     config_regs = [
         ("config_slave_id", 0x1071),
-        ("config_speed_code", 0x1072),     # 0=9600, 1=19200
-        ("config_parity_code", 0x1073),    # 0=none, 1=odd, 2=even
-        ("config_length_code", 0x1074),    # 0=8 bits, 1=7 bits
-        ("config_stopbits_code", 0x1075),  # 0=1 bit, 1=2 bits
+        ("config_speed_code", 0x1072),
+        ("config_parity_code", 0x1073),
+        ("config_length_code", 0x1074),
+        ("config_stopbits_code", 0x1075),
     ]
 
     for name, addr in config_regs:
@@ -521,29 +515,21 @@ def read_device_config_basic(
 
 
 def append_csv(path: str, row: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    path_obj = Path(path)
+    path_obj.parent.mkdir(parents=True, exist_ok=True)
 
-    file_exists = os.path.exists(path) and os.path.getsize(path) > 0
-
+    file_exists = path_obj.exists() and path_obj.stat().st_size > 0
     if file_exists:
-        with open(path, "r", newline="", encoding="utf-8") as f:
+        with path_obj.open("r", newline="", encoding="utf-8") as f:
             reader = csv.reader(f)
-            existing_header = next(reader)
-        fieldnames = existing_header
-        # Si aparecen nuevas columnas, reescribimos encabezado preservando datos previos.
-        missing = [k for k in row.keys() if k not in fieldnames]
-        if missing:
-            with open(path, "r", newline="", encoding="utf-8") as f:
-                old_rows = list(csv.DictReader(f))
-            fieldnames = fieldnames + missing
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(old_rows)
+            try:
+                fieldnames = next(reader)
+            except StopIteration:
+                fieldnames = list(row.keys())
     else:
         fieldnames = list(row.keys())
 
-    with open(path, "a", newline="", encoding="utf-8") as f:
+    with path_obj.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         if not file_exists:
             writer.writeheader()
@@ -596,106 +582,97 @@ def print_human(data: Dict[str, Any], errors: Dict[str, str]) -> None:
             print(f"{k}: {v}")
 
 
-def run_once(args: argparse.Namespace) -> Tuple[Dict[str, Any], Dict[str, str]]:
-    parity = parse_parity(args.parity)
-    inst = make_instrument(
-        port=args.port,
-        slave=args.slave,
-        baudrate=args.baud,
-        parity=parity,
-        bytesize=args.bytesize,
-        stopbits=args.stopbits,
-        timeout=args.timeout,
-        debug=args.debug,
-    )
+def collect_row(inst: minimalmodbus.Instrument, settings: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    parity = parse_parity(settings["parity"])
+    inst.serial.baudrate = settings["baud"]
+    inst.serial.bytesize = settings["bytesize"]
+    inst.serial.parity = parity
+    inst.serial.stopbits = settings["stopbits"]
+    inst.serial.timeout = settings["timeout"]
+    inst.debug = settings["debug"]
 
     row, errors = read_measurements(
         inst,
-        voltage_scale=args.voltage_scale,
-        retries=args.retries,
+        voltage_scale=settings["voltage_scale"],
+        retries=settings["retries"],
     )
 
-    if args.status:
-        status, status_errors = read_status(inst, retries=args.retries, max_relays=args.max_relays)
+    if settings["status"]:
+        status, status_errors = read_status(inst, retries=settings["retries"], max_relays=settings["max_relays"])
         row.update(status)
         errors.update(status_errors)
 
-    if args.config_read:
-        config, config_errors = read_device_config_basic(inst, retries=args.retries)
+    if settings["config_read"]:
+        config, config_errors = read_device_config_basic(inst, retries=settings["retries"])
         row.update(config)
         errors.update(config_errors)
 
-    row["slave_id"] = args.slave
-    row["serial_port"] = args.port
-
+    row["slave_id"] = settings["slave"]
+    row["serial_port"] = settings["port"]
     return row, errors
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Lectura Modbus RTU RS485 para Circutor Computer SMART III / Smart Computer III."
-    )
-
-    # El único argumento realmente necesario es --config si quieres usar otro archivo.
-    # Si no lo pasas, el script busca config.ini en la misma carpeta que read.py.
-    parser.add_argument(
-        "--config",
-        default=str(DEFAULT_CONFIG_PATH),
-        help="Ruta del archivo de configuración. Default: config.ini junto a read.py",
-    )
-
-    # Todos los siguientes argumentos son opcionales y sirven para sobrescribir config.ini.
-    parser.add_argument("--port", default=None, help="Puerto serial. Ej: COM5, /dev/ttyUSB0")
-    parser.add_argument("--slave", type=int, default=None, help="ID Modbus / Num. periférico")
-    parser.add_argument("--baud", type=int, default=None, help="Baudios. Ej: 19200")
-    parser.add_argument("--parity", default=None, help="Paridad: none, even, odd")
-    parser.add_argument("--bytesize", type=int, default=None, help="Bits de datos. Normalmente 8")
-    parser.add_argument("--stopbits", type=int, default=None, help="Stop bits. Normalmente 1")
-    parser.add_argument("--timeout", type=float, default=None, help="Timeout serial en segundos")
-    parser.add_argument("--retries", type=int, default=None, help="Reintentos por registro")
-    parser.add_argument("--interval", type=float, default=None, help="Intervalo entre lecturas en segundos")
-    parser.add_argument("--once", action="store_true", help="Forzar una sola lectura")
-    parser.add_argument("--csv", default=None, help="Ruta de salida CSV")
-    parser.add_argument("--json", action="store_true", help="Imprime JSON completo")
-    parser.add_argument("--status", action="store_true", help="Incluye relés, alarmas, salidas y entradas digitales")
-    parser.add_argument("--config-read", action="store_true", help="Lee configuración básica de comunicaciones")
-    parser.add_argument("--max-relays", type=int, default=None, choices=[6, 12, 14], help="Modelo por número de relés")
-    parser.add_argument("--voltage-scale", type=float, default=None, help="Factor para tensión. Default recomendado: 0.1")
-    parser.add_argument("--debug", action="store_true", help="Activa debug de minimalmodbus")
-
-    cli_args = parser.parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
 
     try:
-        args = load_runtime_args(cli_args)
+        base_settings = load_config(DEFAULT_CONFIG_PATH)
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
-        if not (1 <= args.slave <= 254):
-            print("ERROR: slave_id debe estar entre 1 y 254.", file=sys.stderr)
-            return 2
+    settings = merge_settings(base_settings, args)
 
-        print("\n--- Configuración activa ---")
-        print(f"Config: {args.config_path}")
-        print(f"Puerto: {args.port}")
-        print(f"Slave ID: {args.slave}")
-        print(f"Baudrate: {args.baud}")
-        print(f"CSV: {args.csv}")
-        print(f"Once: {args.once}")
-        print(f"Intervalo: {args.interval} s")
+    if not (1 <= settings["slave"] <= 254):
+        print("ERROR: --slave debe estar entre 1 y 254.", file=sys.stderr)
+        return 2
+
+    if settings["interval_seconds"] is None:
+        settings["interval_seconds"] = 10.0
+
+    inst: Optional[minimalmodbus.Instrument] = None
+    try:
+        parity = parse_parity(settings["parity"])
+        inst = make_instrument(
+            port=settings["port"],
+            slave=settings["slave"],
+            baudrate=settings["baud"],
+            parity=parity,
+            bytesize=settings["bytesize"],
+            stopbits=settings["stopbits"],
+            timeout=settings["timeout"],
+            debug=settings["debug"],
+        )
 
         while True:
-            row, errors = run_once(args)
+            cycle_start = time.monotonic()
 
-            if args.json:
-                print(json.dumps({"data": row, "errors": errors}, indent=2, ensure_ascii=False))
+            row, errors = collect_row(inst, settings)
+
+            if settings["print_json"]:
+                print(json.dumps({"data": row, "errors": errors}, indent=2, ensure_ascii=False), flush=True)
             else:
                 print_human(row, errors)
 
-            append_csv(args.csv, row)
-            print(f"\nCSV actualizado: {args.csv}")
+            append_csv(str(settings["csv_path"]), row)
+            print(f"\nCSV actualizado: {settings['csv_path']}", flush=True)
 
-            if args.once or args.interval <= 0:
+            if settings["once"]:
                 break
 
-            time.sleep(args.interval)
+            elapsed = time.monotonic() - cycle_start
+            sleep_seconds = max(0.0, settings["interval_seconds"] - elapsed)
+
+            if sleep_seconds > 0:
+                print(f"Siguiente lectura en {sleep_seconds:.1f} segundos...", flush=True)
+                time.sleep(sleep_seconds)
+            else:
+                print(
+                    f"ADVERTENCIA: el ciclo tardo {elapsed:.1f} s, mas que el intervalo configurado de "
+                    f"{settings['interval_seconds']:.1f} s. Iniciando siguiente lectura inmediatamente.",
+                    flush=True,
+                )
 
     except KeyboardInterrupt:
         print("\nInterrumpido por usuario.")
@@ -706,6 +683,12 @@ def main() -> int:
     except Exception as exc:
         print(f"ERROR general: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if inst is not None and hasattr(inst, "serial"):
+            try:
+                inst.serial.close()
+            except Exception:
+                pass
 
     return 0
 
